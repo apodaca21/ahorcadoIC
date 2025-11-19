@@ -2,7 +2,9 @@
 from collections import Counter, defaultdict
 import unicodedata, re, random, math, os
 import matplotlib.pyplot as plt
+from matplotlib.widgets import Button, TextBox
 from matplotlib.widgets import Button
+
 
 # ==============================
 #  Normalización y carga de corpus
@@ -168,27 +170,101 @@ def pick_by_lookahead(
 # ==============================
 #  Agente
 # ==============================
+# ==============================
+#  Agente automático (algoritmo)
+# ==============================
 
-class HangmanAgent:
+class AutoHangmanAgent:
+    """
+    Agente que usa el corpus de palabras + heurísticas para adivinar la palabra.
+    No depende de ninguna clase externa.
+    """
     def __init__(self, words, scorer="lookahead"):
         self.words = words
         self.scorer = scorer
+        self.alphabet = list("abcdefghijklmnñopqrstuvwxyz")
 
     def next_guess(self, pattern, excluded, included_positions, tried,
                    errors_left=None, max_errors=None):
+        # Filtrar candidatos compatibles con el patrón actual
         cands = filter_candidates(self.words, pattern, excluded, included_positions)
+
+        # Si no hay candidatos, elegimos una letra random que falte
         if not cands:
-            return None, []
+            choices = [c for c in self.alphabet if c not in tried and c not in excluded]
+            ch = random.choice(choices) if choices else None
+            return ch, []
+
+        # Elegir letra según la heurística
         if self.scorer == "freq":
             ch = pick_by_conditional_freq(cands, tried)
         elif self.scorer == "info":
             ch = pick_by_info_gain(cands, tried)
-        else:  # "lookahead"
+        else:  # "lookahead" (por defecto)
             ch = pick_by_lookahead(
-                cands, tried, pattern, included_positions,
-                errors_left, max_errors
+                cands,
+                tried,
+                pattern,
+                included_positions,
+                errors_left=errors_left,
+                max_errors=max_errors
             )
-        return ch, cands
+
+        # Si por alguna razón no encuentra letra, fallback aleatorio
+        if ch is None:
+            choices = [c for c in self.alphabet if c not in tried and c not in excluded]
+            ch = random.choice(choices) if choices else None
+
+        return ch, []
+
+class HumanAgent:
+    """
+    Agente humano que pide la letra desde un TextBox en la ventana.
+    Usa un diccionario compartido `input_state` para recibir la letra
+    desde el callback del botón "Probar letra".
+    """
+    def __init__(self, input_state, alphabet=None):
+        if alphabet is None:
+            alphabet = list("abcdefghijklmnñopqrstuvwxyz")
+        self.alphabet = alphabet
+        self.input_state = input_state  # {"letter": ..., "waiting": ...}
+
+    def _esperar_letra(self):
+        # Reiniciamos estado y esperamos a que el callback ponga una letra
+        self.input_state["letter"] = None
+        self.input_state["waiting"] = True
+
+        # Bucle de espera mientras el usuario no haya pulsado el botón
+        while self.input_state["waiting"]:
+            # Esto deja respirar a la UI de matplotlib
+            plt.pause(0.05)
+
+        return self.input_state["letter"]
+
+    def next_guess(self, pattern, excluded, included_positions, tried,
+                   errors_left=None, max_errors=None):
+        print("\nPatrón actual:", pattern)
+        print("Letras ya intentadas:",
+              " ".join(sorted(tried)) if tried else "ninguna")
+
+        while True:
+            print("👉 Escribe una letra en el cuadro de texto y pulsa 'Probar letra'.")
+            ch = self._esperar_letra()
+
+            if ch is None:
+                continue
+
+            if ch not in self.alphabet:
+                print("⚠️ Debe ser una letra del alfabeto español.")
+                continue
+
+            if ch in tried:
+                print("⚠️ Ya intentaste esa letra, prueba con otra.")
+                continue
+
+            # Devuelve la letra y lista vacía para ser compatible con el resto del código
+            return ch, []
+
 
 # ==============================
 #  Simulación (texto, por si la quieres usar)
@@ -254,14 +330,13 @@ def pick_word_by_difficulty(pool_words, freq, difficulty):
 
 def make_noisy_agent(words, scorer="lookahead", noise=0.0):
     """
-    Envuelve a HangmanAgent con algo de 'ruido':
+    Crea un AutoHangmanAgent y le agrega 'ruido':
     - Con probabilidad = noise, elige una letra aleatoria.
     - Si no, usa la heurística normal del agente.
     """
-    base = HangmanAgent(words, scorer=scorer)
+    base = AutoHangmanAgent(words, scorer=scorer)
     alphabet = list("abcdefghijklmnñopqrstuvwxyz")
 
-    # Guardamos la versión original ANTES de sobrescribirla
     original_next = base.next_guess
 
     def next_guess_noisy(pattern, excluded, included_positions, tried,
@@ -272,12 +347,13 @@ def make_noisy_agent(words, scorer="lookahead", noise=0.0):
             ch = random.choice(choices) if choices else None
             return ch, []
 
-        # Si no hay ruido, usamos la función original
+        # Sin ruido → usar la lógica "inteligente"
         return original_next(pattern, excluded, included_positions, tried,
-                             errors_left, max_errors)
+                             errors_left=errors_left, max_errors=max_errors)
 
     base.next_guess = next_guess_noisy
     return base
+
 
 LEVELS = {
     # Más vidas y cero ruido → realmente fácil
@@ -440,8 +516,7 @@ def play_visual_graphic_spacious(word, agent, max_errors=6, sleep=1.0,
 
 # ==============================
 #  main con botones de dificultad
-# ==============================
-
+    # ==============================
 def main():
     # Preparar corpus y conjuntos de palabras
     corpus_path = "es_corpus.txt"
@@ -460,20 +535,82 @@ def main():
     # Eje grande para el ahorcado
     ax_main = fig.add_axes([0.05, 0.25, 0.9, 0.7])
 
-    # Dibujo inicial "en blanco"
-    draw_hangman_matplotlib_spacious(ax_main, 0, "_______", set(), max_errors=6)
-    ax_main.text(8, 3.0, "Haz clic en una dificultad para empezar",
-                 fontsize=12, ha='center', va='center', color="#333")
-    fig.canvas.draw()
+    # ----- Estado compartido para el agente humano -----
+    human_input = {"letter": None, "waiting": False}
+
+    # ----- Cuadro de texto y botón para escribir letras (fila de abajo) -----
+    ax_box = fig.add_axes([0.05, 0.02, 0.30, 0.05])
+    txt_letra = TextBox(ax_box, "Letra:", initial="")
+
+    ax_btn_letra = fig.add_axes([0.40, 0.02, 0.25, 0.05])
+    btn_letra = Button(ax_btn_letra, "Probar letra")
+
+    def enviar_letra(event):
+        texto = txt_letra.text.strip().lower()
+        if not texto:
+            print("⚠️ Escribe al menos una letra en el cuadro.")
+            return
+
+        ch = normalize(texto[0], keep_accents=False)
+        human_input["letter"] = ch
+        human_input["waiting"] = False
+        txt_letra.set_val("")
+
+    btn_letra.on_clicked(enviar_letra)
+
+    # ----- Estado del modo actual (por defecto, algoritmo) -----
+    mode = {"value": "algoritmo"}  # "algoritmo" o "jugador"
+
+    def actualizar_texto_modo():
+        """Limpia el eje y dibuja el mensaje del modo actual."""
+        ax_main.clear()
+        draw_hangman_matplotlib_spacious(ax_main, 0, "_______", set(), max_errors=6)
+
+        if mode["value"] == "algoritmo":
+            titulo = "Modo: ALGORITMO"
+            texto = (
+                "La computadora (agente) intentará adivinar la palabra.\n"
+                "1) Elige la dificultad arriba.\n"
+                "2) Solo observa cómo va jugando."
+            )
+        else:
+            titulo = "Modo: 1 JUGADOR"
+            texto = (
+                "Tú intentas adivinar la palabra letra por letra.\n"
+                "1) Elige la dificultad arriba.\n"
+                "2) Escribe letras en el cuadro de texto y pulsa 'Probar letra'."
+            )
+
+        ax_main.text(8, 17.0, titulo,
+                     fontsize=14, ha='center', va='center',
+                     color="#111", fontweight='bold')
+        ax_main.text(8, 4.5, texto,
+                     fontsize=11, ha='center', va='center',
+                     color="#333")
+
+        fig.canvas.draw_idle()
+
+    # Mostrar mensaje inicial
+    actualizar_texto_modo()
 
     # ----- Función para iniciar una partida -----
     def start_game(difficulty):
         cfg = LEVELS[difficulty]
         target = pick_word_by_difficulty(test, freq, difficulty)
-        agent = make_noisy_agent(train, scorer=cfg["scorer"], noise=cfg["noise"])
 
-        print(f"\n🎮 Dificultad: {difficulty} | max_errors={cfg['max_errors']} | noise={cfg['noise']}")
-        print("El agente comenzará a jugar. Observa la ventana del ahorcado.\n")
+        print(f"\n▶ Iniciando partida | modo={mode['value']} | dificultad={difficulty}")
+
+        if mode["value"] == "algoritmo":
+            # El agente automático juega solo
+            agent = make_noisy_agent(train, scorer=cfg["scorer"], noise=cfg["noise"])
+            print(f"🎮 Modo ALGORITMO | max_errors={cfg['max_errors']} | noise={cfg['noise']}")
+            print("El agente comenzará a jugar. Observa la ventana del ahorcado.\n")
+        else:
+            # Modo 1 jugador: el usuario mete las letras desde el TextBox
+            agent = HumanAgent(human_input)
+            print(f"🎮 Modo 1 JUGADOR | max_errors={cfg['max_errors']}")
+            print("La computadora escogió una palabra.\n"
+                  "Escribe letras en el cuadro de texto de la ventana y pulsa 'Probar letra'.\n")
 
         play_visual_graphic_spacious(
             target,
@@ -484,11 +621,31 @@ def main():
             ax=ax_main
         )
 
-    # ----- Crear botones de dificultad -----
-    ax_facil = fig.add_axes([0.05, 0.05, 0.18, 0.08])
-    ax_medio = fig.add_axes([0.28, 0.05, 0.18, 0.08])
-    ax_dificil = fig.add_axes([0.51, 0.05, 0.18, 0.08])
-    ax_imposible = fig.add_axes([0.74, 0.05, 0.18, 0.08])
+    # ----- Botones de modo (fila intermedia) -----
+    ax_modo_jugador = fig.add_axes([0.10, 0.10, 0.30, 0.07])
+    ax_modo_algo = fig.add_axes([0.55, 0.10, 0.30, 0.07])
+
+    btn_modo_jugador = Button(ax_modo_jugador, "1 JUGADOR")
+    btn_modo_algo = Button(ax_modo_algo, "ALGORITMO")
+
+    def set_modo_jugador(event):
+        mode["value"] = "jugador"
+        print("\n🔁 Cambiaste al modo 1 JUGADOR.")
+        actualizar_texto_modo()
+
+    def set_modo_algo(event):
+        mode["value"] = "algoritmo"
+        print("\n🔁 Cambiaste al modo ALGORITMO.")
+        actualizar_texto_modo()
+
+    btn_modo_jugador.on_clicked(set_modo_jugador)
+    btn_modo_algo.on_clicked(set_modo_algo)
+
+    # ----- Botones de dificultad (fila de arriba) -----
+    ax_facil = fig.add_axes([0.05, 0.18, 0.18, 0.07])
+    ax_medio = fig.add_axes([0.28, 0.18, 0.18, 0.07])
+    ax_dificil = fig.add_axes([0.51, 0.18, 0.18, 0.07])
+    ax_imposible = fig.add_axes([0.74, 0.18, 0.18, 0.07])
 
     btn_facil = Button(ax_facil, "Fácil")
     btn_medio = Button(ax_medio, "Medio")
@@ -502,6 +659,7 @@ def main():
 
     # Mostrar ventana (el programa vive mientras la ventana esté abierta)
     plt.show(block=True)
+
 
 
 if __name__ == "__main__":
